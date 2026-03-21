@@ -80,10 +80,10 @@ log "Waiting briefly for logs to flush..."
 sleep 3
 
 log "Extracting results..."
-RUN_ID=$(grep -oP 'RUN_ID=\K[a-f0-9-]+' "$WORKDIR/train.log" 2>/dev/null | head -1 || true)
+RUN_ID=$(grep -m1 'logs/.*\.txt' "$WORKDIR/train.log" 2>/dev/null | grep -oP 'logs/\K[^/]+(?=\.txt)' | head -1 || true)
 if [[ -z "$RUN_ID" ]]; then
     log "Could not detect RUN_ID from train.log, scanning logs dir..."
-    RUN_ID=$(ls -t "$LOG_DIR"/run_*.txt 2>/dev/null | head -1 | xargs basename -s .txt 2>/dev/null || true)
+    RUN_ID=$(ls -t "$LOG_DIR"/ 2>/dev/null | grep -E '^[^.]+\.txt$' | head -1 | sed 's/\.txt$//' || true)
 fi
 
 if [[ -z "$RUN_ID" ]]; then
@@ -114,10 +114,12 @@ if [[ -f "$WORKDIR/final_model.int8.ptz" ]]; then
     log "Saved model as: $MODEL_NAME"
 fi
 
-if [[ -f "$WORKDIR/logs/${RUN_ID}_loss.html" ]]; then
+if [[ -n "$RUN_ID" && -f "$WORKDIR/logs/${RUN_ID}_loss.html" ]]; then
     CHART_NAME="${TIMESTAMP}_${COMMIT_ID}_${VAL_BPB}_loss.html"
     cp "$WORKDIR/logs/${RUN_ID}_loss.html" "$RESULTS_DIR/$CHART_NAME"
     log "Saved chart as: $CHART_NAME"
+else
+    log "Chart not found (RUN_ID=$RUN_ID, path=$WORKDIR/logs/${RUN_ID}_loss.html)"
 fi
 
 if kill -0 "$WEB_PID" 2>/dev/null; then
