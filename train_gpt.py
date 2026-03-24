@@ -19,6 +19,13 @@ import uuid
 import zlib
 from pathlib import Path
 
+try:
+    import zstandard
+
+    _COMPRESSOR = "zstd"
+except ImportError:
+    _COMPRESSOR = "zlib"
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -29,7 +36,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 
     PLOTLY_AVAILABLE = True
 except ImportError:
@@ -62,21 +68,21 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 50))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 2000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    iterations = int(os.environ.get("ITERATIONS", 20000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 0))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -84,20 +90,20 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(
-        os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
+        os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92)
     )
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
 
 # -----------------------------
@@ -1043,10 +1049,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
 
-    train_losses: list[float] = []
-    train_steps: list[int] = []
-    val_losses: list[float] = []
-    val_steps: list[int] = []
+    train_losses: list[tuple[int, float]] = []
+    val_losses: list[tuple[int, float]] = []
     chart_path = None
     if master_process and PLOTLY_AVAILABLE:
         chart_path = f"logs/{args.run_id}_loss.html"
@@ -1065,19 +1069,20 @@ def main() -> None:
         )
         fig.write_html(chart_path, auto_open=False)
 
-    def update_chart(train_loss: float, val_loss: float | None, step: int) -> None:
+    def update_chart(
+        train_loss: float | None, val_loss: float | None, step: int
+    ) -> None:
         if not master_process or not PLOTLY_AVAILABLE or chart_path is None:
             return
-        train_losses.append(train_loss)
-        train_steps.append(step)
+        if train_loss is not None:
+            train_losses.append([step, train_loss])
         if val_loss is not None:
-            val_losses.append(val_loss)
-            val_steps.append(step)
+            val_losses.append([step, val_loss])
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
-                x=train_steps,
-                y=train_losses,
+                x=[loss[0] for loss in train_losses],
+                y=[loss[1] for loss in train_losses],
                 mode="lines",
                 name="Train Loss",
                 line=dict(color="blue"),
@@ -1086,8 +1091,8 @@ def main() -> None:
         if val_losses:
             fig.add_trace(
                 go.Scatter(
-                    x=val_steps,
-                    y=val_losses,
+                    x=[loss[0] for loss in val_losses],
+                    y=[loss[1] for loss in val_losses],
                     mode="lines+markers",
                     name="Val Loss",
                     line=dict(color="red"),
@@ -1234,7 +1239,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            update_chart(train_losses[-1] if train_losses else 0.0, val_loss, step)
+            update_chart(None, val_loss, step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 

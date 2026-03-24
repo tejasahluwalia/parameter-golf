@@ -1,6 +1,7 @@
 numpy
 tqdm
 torch
+python-fasthtml
 huggingface-hub
 kernels
 setuptools
